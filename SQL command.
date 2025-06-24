@@ -1,0 +1,145 @@
+-- Create and use the database
+CREATE DATABASE feature_flag_system;
+USE feature_flag_system;
+
+-- Schema Creation
+CREATE TABLE environments (
+    environment_id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(50) UNIQUE NOT NULL
+);
+
+CREATE TABLE users (
+    user_id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(100) UNIQUE NOT NULL
+);
+
+CREATE TABLE `groups` (
+    group_id INT AUTO_INCREMENT PRIMARY KEY,
+    group_name VARCHAR(100) UNIQUE NOT NULL
+);
+
+CREATE TABLE user_group_membership (
+    user_id INT,
+    group_id INT,
+    PRIMARY KEY (user_id, group_id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (group_id) REFERENCES `groups`(group_id)
+);
+
+CREATE TABLE feature_flags (
+    flag_id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) UNIQUE NOT NULL,
+    description TEXT,
+    is_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    environment_id INT,
+    expiry_date DATETIME NULL,
+    deleted BOOLEAN DEFAULT FALSE,
+    category VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (environment_id) REFERENCES environments(environment_id)
+);
+
+CREATE TABLE flag_assignments (
+    assignment_id INT AUTO_INCREMENT PRIMARY KEY,
+    flag_id INT,
+    user_id INT DEFAULT NULL,
+    group_id INT DEFAULT NULL,
+    percentage_rollout INT DEFAULT 100 CHECK (percentage_rollout BETWEEN 0 AND 100),
+    FOREIGN KEY (flag_id) REFERENCES feature_flags(flag_id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (group_id) REFERENCES `groups`(group_id)
+);
+
+CREATE TABLE flag_dependencies (
+    flag_id INT,
+    depends_on_flag_id INT,
+    PRIMARY KEY (flag_id, depends_on_flag_id),
+    FOREIGN KEY (flag_id) REFERENCES feature_flags(flag_id),
+    FOREIGN KEY (depends_on_flag_id) REFERENCES feature_flags(flag_id)
+);
+
+CREATE TABLE flag_audit_logs (
+    log_id INT AUTO_INCREMENT PRIMARY KEY,
+    flag_id INT,
+    action ENUM('CREATE', 'UPDATE', 'DELETE'),
+    actor VARCHAR(100),
+    action_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (flag_id) REFERENCES feature_flags(flag_id)
+);
+
+CREATE TABLE flag_history (
+    history_id INT AUTO_INCREMENT PRIMARY KEY,
+    flag_id INT,
+    old_state TEXT,
+    new_state TEXT,
+    changed_by VARCHAR(100),
+    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (flag_id) REFERENCES feature_flags(flag_id)
+);
+
+-- Sample Data Insertion
+INSERT INTO environments (name) VALUES ('development'), ('staging'), ('production');
+INSERT INTO users (username) VALUES ('alice'), ('bob'), ('charlie');
+INSERT INTO `groups` (group_name) VALUES ('QA'), ('DevOps');
+INSERT INTO user_group_membership VALUES (1, 1), (2, 2);
+
+INSERT INTO feature_flags (name, description, is_enabled, environment_id, category)
+VALUES ('NewDashboard', 'Enable the new dashboard UI', 0, 1, 'UI'),
+       ('BetaFeature', 'Limited rollout beta', 0, 2, 'Experimental');
+
+INSERT INTO flag_assignments (flag_id, user_id, percentage_rollout) VALUES (1, 1, 50);
+INSERT INTO flag_assignments (flag_id, group_id) VALUES (2, 2);
+
+INSERT INTO flag_dependencies VALUES (2, 1);
+
+-- Trigger: Log on change
+DELIMITER //
+CREATE TRIGGER trg_flag_update
+AFTER UPDATE ON feature_flags
+FOR EACH ROW
+BEGIN
+    INSERT INTO flag_audit_logs(flag_id, action, actor)
+    VALUES (NEW.flag_id, 'UPDATE', 'system');
+    INSERT INTO flag_history(flag_id, old_state, new_state, changed_by)
+    VALUES (NEW.flag_id, OLD.description, NEW.description, 'system');
+END;//
+DELIMITER ;
+
+-- View: Active Flags for a Specific User (example: user_id = 1)
+CREATE VIEW active_user_flags AS
+SELECT DISTINCT ff.name, ff.description, ff.environment_id
+FROM feature_flags ff
+LEFT JOIN flag_assignments fa ON ff.flag_id = fa.flag_id
+LEFT JOIN user_group_membership ugm ON fa.group_id = ugm.group_id
+WHERE ff.is_enabled = 1 AND ff.deleted = 0
+AND (fa.user_id = 1 OR ugm.user_id = 1);
+
+-- Sample Queries
+-- 1. Retrieve active flags for user 1 in development
+SELECT ff.*
+FROM feature_flags ff
+JOIN environments e ON ff.environment_id = e.environment_id
+JOIN flag_assignments fa ON ff.flag_id = fa.flag_id
+LEFT JOIN user_group_membership ugm ON fa.group_id = ugm.group_id
+WHERE e.name = 'development'
+AND (fa.user_id = 1 OR ugm.user_id = 1)
+AND ff.is_enabled = TRUE
+AND (ff.expiry_date IS NULL OR ff.expiry_date > NOW())
+AND ff.deleted = FALSE;
+
+-- 2. List flag dependencies
+SELECT f1.name AS Flag, f2.name AS Depends_On
+FROM flag_dependencies fd
+JOIN feature_flags f1 ON fd.flag_id = f1.flag_id
+JOIN feature_flags f2 ON fd.depends_on_flag_id = f2.flag_id;
+
+-- 3. Soft delete a flag
+UPDATE feature_flags SET deleted = TRUE WHERE flag_id = 1;
+
+-- 4. Enable a flag for a specific group
+UPDATE feature_flags SET is_enabled = TRUE WHERE name = 'BetaFeature';
+INSERT INTO flag_assignments (flag_id, group_id) SELECT flag_id, 2 FROM feature_flags WHERE name = 'BetaFeature';
+
+-- 5. Check audit logs
+SELECT * FROM flag_audit_logs ORDER BY action_time DESC;
